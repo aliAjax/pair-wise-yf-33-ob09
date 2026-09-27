@@ -1,3 +1,18 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>卫星地面站排程台</title>
 <style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#eef5f7;padding:0 20px;color:#102a43}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}pre{background:#071827;color:#67e8f9;padding:16px;border-radius:8px;overflow:auto}input,button{font:inherit;padding:8px;margin:4px}button{background:#0369a1;color:white;border:0;border-radius:6px}</style>
-<h1>卫星地面站排程台</h1><p>查看请求、接收排程与站点状态。写入使用 JSON API，身份由 X-User-Id、X-Role 和租户头提供。</p><section><input id="u" value="operator"><input id="r" value="operator"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<h1>卫星地面站排程台</h1><p>查看请求、接收排程与站点状态。写入使用 JSON API，身份由 X-User-Id、X-Role 和租户头提供。</p><section><input id="u" value="operator"><input id="r" value="operator"><button onclick="load()">刷新</button><pre id="o"></pre></section>
+<section><h2>临时配额借用</h2>
+<p>同一地面站、同一天，把转出方未使用的额度临时转给借入方；超出可借额度不登记，已有配额和排程不变。撤销只退还未被排程消耗的部分。</p>
+<p>登记借用：
+<input id="bst" placeholder="地面站 GS1" value="GS1"><input id="bday" placeholder="日期 YYYY-MM-DD"><input id="bfrom" placeholder="转出租户 T1"><input id="bto" placeholder="借入租户 T2"><input id="bsec" placeholder="秒数" type="number"><button onclick="borrow()">登记</button></p>
+<p>撤销借用：<input id="brid" placeholder="借用记录 ID" type="number"><input id="brreason" placeholder="撤销原因"><button onclick="revoke()">撤销</button></p>
+<p>查询：<button onclick="borrows()">账本</button><button onclick="occupancy()">占用明细</button> （占用明细只需地面站 + 日期）</p><pre id="bo"></pre></section>
+<script>
+function hdr(){return {'X-User-Id':u.value,'X-Role':r.value,'Content-Type':'application/json'}}
+function today(){return new Date().toISOString().slice(0,10)}
+window.addEventListener('load',()=>{bday.value=today()});
+async function borrow(){let x=await fetch('/api/quota-borrows',{method:'POST',headers:hdr(),body:JSON.stringify({station_id:bst.value,day:bday.value,from_tenant:bfrom.value,to_tenant:bto.value,seconds:parseInt(bsec.value)})});bo.textContent=JSON.stringify(await x.json(),null,2)}
+async function revoke(){let x=await fetch(`/api/quota-borrows/${parseInt(brid.value)}/revoke`,{method:'POST',headers:hdr(),body:JSON.stringify({reason:brreason.value})});bo.textContent=JSON.stringify(await x.json(),null,2)}
+async function borrows(){let q=new URLSearchParams();if(bst.value)q.set('station_id',bst.value);if(bday.value)q.set('day',bday.value);let x=await fetch('/api/quota-borrows?'+q,{headers:hdr()});bo.textContent=JSON.stringify(await x.json(),null,2)}
+async function occupancy(){let q=new URLSearchParams({station_id:bst.value,day:bday.value});let x=await fetch('/api/quota-occupancy?'+q,{headers:hdr()});bo.textContent=JSON.stringify(await x.json(),null,2)}
+async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>

@@ -11,15 +11,12 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+from borrowing import ApiError, BorrowingLedger, QuotaBorrowPolicy
 
 PORT = 8204
 ROLES = {"viewer", "requester", "operator", "commander", "auditor"}
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str, details: Any = None):
-        super().__init__(message); self.status, self.code, self.message, self.details = status, code, message, details
 
 
 def utcnow() -> datetime: return datetime.now(timezone.utc)
@@ -47,6 +44,8 @@ class Repository:
         CREATE TABLE IF NOT EXISTS schedules(id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL UNIQUE REFERENCES requests(id), window_id INTEGER NOT NULL REFERENCES visibility_windows(id), station_id TEXT NOT NULL REFERENCES stations(id), antenna_id TEXT NOT NULL REFERENCES antennas(id), satellite_id TEXT NOT NULL REFERENCES satellites(id), starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, rate_mbps REAL NOT NULL, status TEXT NOT NULL DEFAULT 'scheduled', revision INTEGER NOT NULL DEFAULT 1, disposition_reason TEXT, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER, schedule_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
         """)
+        # 借用账本表结构由账本模块单独维护
+        BorrowingLedger().initialize(self.conn)
 
     @contextmanager
     def tx(self):
@@ -61,7 +60,10 @@ class Repository:
 
 
 class SatelliteSchedulingService:
-    def __init__(self, path: str | Path): self.repo = Repository(path)
+    def __init__(self, path: str | Path):
+        self.repo = Repository(path)
+        self.borrow_ledger = BorrowingLedger()
+        self.borrow_policy = QuotaBorrowPolicy(self.borrow_ledger)
 
     @staticmethod
     def identity(headers: Any) -> tuple[str, str, str]:
@@ -131,6 +133,85 @@ class SatelliteSchedulingService:
             conn.execute("INSERT INTO quotas(tenant,station_id,daily_seconds) VALUES(?,?,?) ON CONFLICT(tenant,station_id) DO UPDATE SET daily_seconds=excluded.daily_seconds", (tenant, station, seconds))
             return dict(conn.execute("SELECT * FROM quotas WHERE tenant=? AND station_id=?", (tenant, station)).fetchone())
 
+    def register_borrow(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        """登记临时配额借用：同站、同一天的未使用额度转给另一租户。
+        超出可借额度直接拒绝、不落账；基础配额和已有排程不变。"""
+        if role not in {"operator", "commander"}: raise ApiError(403, "quota_forbidden", "当前角色不能登记配额借用")
+        station = str(body.get("station_id", "")).strip(); day = self.borrow_policy.parse_day(body.get("day"))
+        from_tenant, to_tenant = str(body.get("from_tenant", "")).strip(), str(body.get("to_tenant", "")).strip()
+        seconds = body.get("seconds")
+        with self.repo.tx() as conn:
+            used = self._used_quota(conn, from_tenant, station, day)
+            record = self.borrow_policy.register(conn, station_id=station, day=day, from_tenant=from_tenant,
+                                                 to_tenant=to_tenant, seconds=seconds, actor=actor, used_seconds=used)
+            Repository.audit(conn, None, None, actor, role, "quota_borrowed",
+                             {"borrow_id": record["id"], "station_id": station, "day": day,
+                              "from_tenant": from_tenant, "to_tenant": to_tenant, "seconds": record["seconds"]})
+            return record
+
+    def revoke_borrow(self, borrow_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        """撤销借用：只退还借入方未被排程消耗的部分，已消耗（含已接收）保留。"""
+        if role not in {"operator", "commander"}: raise ApiError(403, "quota_forbidden", "当前角色不能撤销配额借用")
+        reason = str(body.get("reason", "")).strip()
+        if not reason: raise ApiError(400, "reason_required", "撤销原因必填")
+        with self.repo.tx() as conn:
+            record = self.borrow_ledger.get(conn, borrow_id)
+            if not record: raise ApiError(404, "borrow_not_found", "借用记录不存在")
+            used = self._used_quota(conn, record["to_tenant"], record["station_id"], record["day"])
+            result = self.borrow_policy.revoke(conn, record, actor=actor, reason=reason, used_seconds=used)
+            Repository.audit(conn, None, None, actor, role, "quota_borrow_revoked",
+                             {"borrow_id": borrow_id, "station_id": record["station_id"], "day": record["day"],
+                              "from_tenant": record["from_tenant"], "to_tenant": record["to_tenant"],
+                              "seconds": int(record["seconds"]), "returned_seconds": result["returned_seconds"],
+                              "retained_seconds": result["retained_seconds"], "reason": reason})
+            return result
+
+    def list_borrows(self, role: str, query: dict[str, str]) -> dict[str, Any]:
+        if role not in {"operator", "commander", "auditor"}: raise ApiError(403, "quota_forbidden", "当前角色不能查看借用账本")
+        station = query.get("station_id", "").strip(); day = query.get("day", "").strip()
+        tenant = query.get("tenant", "").strip()
+        if day: day = self.borrow_policy.parse_day(day)
+        records = self.borrow_ledger.list_records(self.repo.conn, station_id=station or None,
+                                                  day=day or None, tenant=tenant or None)
+        return {"station_id": station or None, "day": day or None, "tenant": tenant or None,
+                "borrows": [dict(r) for r in records]}
+
+    def quota_occupancy(self, role: str, query: dict[str, str]) -> dict[str, Any]:
+        """调度台占用明细：各租户当日基础/借用构成、生效额度、已排程占用与剩余。"""
+        if role not in {"operator", "commander", "auditor"}: raise ApiError(403, "quota_forbidden", "当前角色不能查看占用明细")
+        station = query.get("station_id", "").strip(); day = self.borrow_policy.parse_day(query.get("day"))
+        conn = self.repo.conn
+        if not conn.execute("SELECT 1 FROM stations WHERE id=?", (station,)).fetchone():
+            raise ApiError(404, "station_not_found", "地面站不存在")
+        rows = conn.execute(
+            """SELECT r.tenant, COALESCE(SUM(strftime('%s',s.ends_at)-strftime('%s',s.starts_at)),0) AS used
+               FROM schedules s JOIN requests r ON r.id=s.request_id
+               WHERE s.station_id=? AND substr(s.starts_at,1,10)=? AND s.status IN ('scheduled','receiving','received')
+               GROUP BY r.tenant""", (station, day)).fetchall()
+        used_map = {row["tenant"]: int(row["used"]) for row in rows}
+        tenants = set(used_map) | self.borrow_ledger.tenants(conn, station, day)
+        tenants |= {row["tenant"] for row in conn.execute(
+            "SELECT tenant FROM quotas WHERE station_id=?", (station,))}
+        tenants_out: list[dict[str, Any]] = []
+        for name in sorted(tenants):
+            base = self.borrow_policy.base_seconds(conn, name, station)
+            totals = self.borrow_ledger.totals(conn, name, station, day)
+            limit = self.borrow_policy.effective_limit(conn, name, station, day)
+            used = used_map.get(name, 0)
+            tenants_out.append({"tenant": name, "base_seconds": base,
+                                "borrowed_in_active": totals["active_in"], "borrowed_in_retained": totals["retained_in"],
+                                "lent_out_active": totals["active_out"], "lent_out_retained": totals["retained_out"],
+                                "effective_seconds": limit, "used_seconds": used,
+                                "available_seconds": None if limit is None else limit - used})
+        schedules = conn.execute(
+            """SELECT s.id, r.tenant, s.station_id, s.antenna_id, s.starts_at, s.ends_at,
+                      strftime('%s',s.ends_at)-strftime('%s',s.starts_at) AS duration_seconds, s.status
+               FROM schedules s JOIN requests r ON r.id=s.request_id
+               WHERE s.station_id=? AND substr(s.starts_at,1,10)=? AND s.status IN ('scheduled','receiving','received')
+               ORDER BY s.starts_at""", (station, day)).fetchall()
+        return {"station_id": station, "day": day,
+                "tenants": tenants_out, "occupancies": [dict(r) for r in schedules]}
+
     def create_request(self, actor: str, role: str, tenant: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"requester", "operator", "commander"}: raise ApiError(403, "request_forbidden", "当前角色不能创建数据请求")
         satellite = str(body.get("satellite_id", "")).strip(); data_mb = body.get("data_mb"); priority = body.get("priority"); deadline = parse_time(body.get("deadline"))
@@ -147,7 +228,7 @@ class SatelliteSchedulingService:
             return dict(conn.execute("SELECT * FROM requests WHERE id=?", (request_id,)).fetchone())
 
     def _used_quota(self, conn: sqlite3.Connection, tenant: str, station: str, day: str, exclude_schedule: int | None = None) -> int:
-        sql = """SELECT COALESCE(SUM((julianday(s.ends_at)-julianday(s.starts_at))*86400),0) FROM schedules s JOIN requests r ON r.id=s.request_id
+        sql = """SELECT COALESCE(SUM(strftime('%s',s.ends_at)-strftime('%s',s.starts_at)),0) FROM schedules s JOIN requests r ON r.id=s.request_id
                  WHERE r.tenant=? AND s.station_id=? AND substr(s.starts_at,1,10)=? AND s.status IN ('scheduled','receiving','received')"""
         args: list[Any] = [tenant, station, day]
         if exclude_schedule is not None: sql += " AND s.id!=?"; args.append(exclude_schedule)
@@ -185,7 +266,14 @@ class SatelliteSchedulingService:
             quota = conn.execute("SELECT daily_seconds FROM quotas WHERE tenant=? AND station_id=?", (request["tenant"], station["id"])).fetchone()
             used = self._used_quota(conn, request["tenant"], station["id"], start.date().isoformat())
             duration = int((end - start).total_seconds())
-            if quota and used + duration > quota["daily_seconds"]: raise ApiError(409, "tenant_quota_exceeded", "租户当日地面站配额不足", {"used_seconds": used, "requested_seconds": duration, "limit": quota["daily_seconds"]})
+            limit = self.borrow_policy.effective_limit(conn, request["tenant"], station["id"], start.date().isoformat())
+            if limit is not None and used + duration > limit:
+                totals = self.borrow_ledger.totals(conn, request["tenant"], station["id"], start.date().isoformat())
+                raise ApiError(409, "tenant_quota_exceeded", "租户当日地面站配额不足",
+                               {"used_seconds": used, "requested_seconds": duration, "limit": limit,
+                                "base_seconds": quota["daily_seconds"] if quota else None,
+                                "borrowed_in_active": totals["active_in"], "borrowed_in_retained": totals["retained_in"],
+                                "lent_out_active": totals["active_out"], "lent_out_retained": totals["retained_out"]})
             cur = conn.execute("""INSERT INTO schedules(request_id,window_id,station_id,antenna_id,satellite_id,starts_at,ends_at,rate_mbps,created_by,created_at,updated_at)
                                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                                (request_id, window_id, station["id"], antenna_id, request["satellite_id"], iso(start), iso(end), float(rate), actor, iso(), iso()))
@@ -313,7 +401,10 @@ class Handler(BaseHTTPRequestHandler):
     def get_api(self, path: str) -> tuple[int, Any]:
         if path == "/health": return 200, {"status": "ok", "service": "satellite-scheduling"}
         actor, role, tenant = self.service.identity(self.headers)
+        query = {k: v[-1] for k, v in parse_qs(urlparse(self.path).query).items()}
         if path == "/api/state": return 200, self.service.state(role, tenant)
+        if path == "/api/quota-borrows": return 200, self.service.list_borrows(role, query)
+        if path == "/api/quota-occupancy": return 200, self.service.quota_occupancy(role, query)
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "schedules"] and parts[2].isdigit(): return 200, self.service.get_schedule(int(parts[2]))
         raise ApiError(404, "not_found", "接口不存在")
@@ -326,9 +417,12 @@ class Handler(BaseHTTPRequestHandler):
             "/api/maintenance": lambda: (201, self.service.create_maintenance(actor, role, body)),
             "/api/visibility-windows": lambda: (201, self.service.create_window(actor, role, body)),
             "/api/quotas": lambda: (200, self.service.set_quota(actor, role, body)),
+            "/api/quota-borrows": lambda: (201, self.service.register_borrow(actor, role, body)),
             "/api/requests": lambda: (201, self.service.create_request(actor, role, tenant, body)),
         }
         if path in actions: return actions[path]()
+        if len(parts) == 4 and parts[:2] == ["api", "quota-borrows"] and parts[2].isdigit() and parts[3] == "revoke":
+            return 200, self.service.revoke_borrow(int(parts[2]), actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "requests"] and parts[2].isdigit():
             rid, action = int(parts[2]), parts[3]
             if action == "schedule": return 201, self.service.schedule_request(rid, actor, role, body)
