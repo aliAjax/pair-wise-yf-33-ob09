@@ -19,7 +19,17 @@ python3 app.py --db satellite_scheduling.db
 - `POST /api/requests/{id}/schedule`、`/reschedule`：排程或重排被抢占请求。
 - `POST /api/schedules/{id}/start`、`/complete`、`/cancel`、`/preempt`：接收状态和紧急抢占。
 - `POST /api/visibility-windows/{id}/change`：窗口变化并返回受影响排程；已接收数据保留。
+- `POST /api/quota-loans`、`POST /api/quota-loans/{id}/revoke`、`GET /api/quota-loans`：临时配额借用的登记、撤销与当日占用明细。
 - `GET /api/state`、`GET /api/schedules/{id}`：权限化状态查询。
+
+## 临时配额借用
+
+同一地面站、同一天的未使用额度可在租户间临时转移（`operator`/`commander` 登记与撤销，`auditor` 可查看明细）：
+
+- 有效额度 = 基础配额 + 借入 − 借出；登记时超出可借额度（借出方有效额度减去当日已占用）不予登记，已有配额和排程不变。
+- 转出后双方按新额度判断新排程，借入方只能在到账额度内安排。
+- 撤销只退还未被排程消耗的部分，已消耗（含已接收）用量保留在借入方。
+- 借用判定（`QuotaPolicy`）与账本（`QuotaLedger`）在 `quota_broker.py` 独立维护，接口层在 `app.py`。
 
 ## 测试
 

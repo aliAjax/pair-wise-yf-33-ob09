@@ -11,7 +11,9 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+from quota_broker import LOAN_ACTIVE, QuotaLedger, QuotaPolicy, used_quota_seconds
 
 PORT = 8204
 ROLES = {"viewer", "requester", "operator", "commander", "auditor"}
@@ -30,6 +32,12 @@ def parse_time(value: str | None) -> datetime:
     except ValueError as exc: raise ApiError(400, "invalid_time", f"时间格式错误: {value}") from exc
     return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
 def overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool: return a_start < b_end and b_start < a_end
+def parse_day(value: str | None) -> str:
+    day = (value or "").strip() or utcnow().date().isoformat()
+    try: parsed = datetime.strptime(day, "%Y-%m-%d").date()
+    except ValueError as exc: raise ApiError(400, "invalid_day", f"日期格式错误: {day}") from exc
+    if parsed.isoformat() != day: raise ApiError(400, "invalid_day", f"日期格式错误: {day}")
+    return day
 
 
 class Repository:
@@ -61,7 +69,10 @@ class Repository:
 
 
 class SatelliteSchedulingService:
-    def __init__(self, path: str | Path): self.repo = Repository(path)
+    def __init__(self, path: str | Path):
+        self.repo = Repository(path)
+        self.ledger = QuotaLedger(self.repo.conn)
+        self.quota_policy = QuotaPolicy(self.ledger)
 
     @staticmethod
     def identity(headers: Any) -> tuple[str, str, str]:
@@ -147,11 +158,7 @@ class SatelliteSchedulingService:
             return dict(conn.execute("SELECT * FROM requests WHERE id=?", (request_id,)).fetchone())
 
     def _used_quota(self, conn: sqlite3.Connection, tenant: str, station: str, day: str, exclude_schedule: int | None = None) -> int:
-        sql = """SELECT COALESCE(SUM((julianday(s.ends_at)-julianday(s.starts_at))*86400),0) FROM schedules s JOIN requests r ON r.id=s.request_id
-                 WHERE r.tenant=? AND s.station_id=? AND substr(s.starts_at,1,10)=? AND s.status IN ('scheduled','receiving','received')"""
-        args: list[Any] = [tenant, station, day]
-        if exclude_schedule is not None: sql += " AND s.id!=?"; args.append(exclude_schedule)
-        return int(conn.execute(sql, args).fetchone()[0])
+        return used_quota_seconds(conn, tenant, station, day, exclude_schedule)
 
     def schedule_request(self, request_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"operator", "commander"}: raise ApiError(403, "schedule_forbidden", "只有排程员可以安排接收")
@@ -182,10 +189,11 @@ class SatelliteSchedulingService:
             if equipment: raise ApiError(409, "antenna_conflict", "天线时段已被占用", {"schedule_id": equipment["id"]})
             satellite_conflict = conn.execute("SELECT id,status FROM schedules WHERE satellite_id=? AND starts_at<? AND ends_at>? AND status IN ('scheduled','receiving')", (request["satellite_id"], iso(end), iso(start))).fetchone()
             if satellite_conflict: raise ApiError(409, "satellite_conflict", "同一卫星时段已被其他站接收", {"schedule_id": satellite_conflict["id"]})
-            quota = conn.execute("SELECT daily_seconds FROM quotas WHERE tenant=? AND station_id=?", (request["tenant"], station["id"])).fetchone()
-            used = self._used_quota(conn, request["tenant"], station["id"], start.date().isoformat())
+            day = start.date().isoformat()
+            used = self._used_quota(conn, request["tenant"], station["id"], day)
             duration = int((end - start).total_seconds())
-            if quota and used + duration > quota["daily_seconds"]: raise ApiError(409, "tenant_quota_exceeded", "租户当日地面站配额不足", {"used_seconds": used, "requested_seconds": duration, "limit": quota["daily_seconds"]})
+            limit = self.quota_policy.effective_limit(conn, request["tenant"], station["id"], day)
+            if limit is not None and used + duration > limit: raise ApiError(409, "tenant_quota_exceeded", "租户当日地面站配额不足（含临时借用额度）", {"used_seconds": used, "requested_seconds": duration, "limit": limit})
             cur = conn.execute("""INSERT INTO schedules(request_id,window_id,station_id,antenna_id,satellite_id,starts_at,ends_at,rate_mbps,created_by,created_at,updated_at)
                                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                                (request_id, window_id, station["id"], antenna_id, request["satellite_id"], iso(start), iso(end), float(rate), actor, iso(), iso()))
@@ -281,6 +289,51 @@ class SatelliteSchedulingService:
             Repository.audit(conn, request_id, None, actor, role, "reschedule_requested", {"reason": body.get("reason", "")})
             return dict(conn.execute("SELECT * FROM requests WHERE id=?", (request_id,)).fetchone())
 
+    def register_quota_loan(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"operator", "commander"}: raise ApiError(403, "quota_loan_forbidden", "当前角色不能登记配额借用")
+        station, from_tenant, to_tenant = str(body.get("station_id", "")).strip(), str(body.get("from_tenant", "")).strip(), str(body.get("to_tenant", "")).strip()
+        seconds, day, reason = body.get("seconds"), parse_day(str(body.get("day") or "")), str(body.get("reason", "")).strip()
+        if not station or not from_tenant or not to_tenant or from_tenant == to_tenant or not isinstance(seconds, int) or seconds <= 0:
+            raise ApiError(400, "invalid_quota_loan", "借用参数无效")
+        with self.repo.tx() as conn:
+            if not conn.execute("SELECT 1 FROM stations WHERE id=?", (station,)).fetchone(): raise ApiError(404, "station_not_found", "地面站不存在")
+            borrowable = self.quota_policy.borrowable(conn, from_tenant, station, day)
+            if seconds > borrowable: raise ApiError(409, "quota_loan_exceeded", "超出可借额度，借用未登记", {"borrowable_seconds": borrowable, "requested_seconds": seconds})
+            loan_id = self.ledger.record(conn, station_id=station, day=day, from_tenant=from_tenant, to_tenant=to_tenant, seconds=seconds, reason=reason, actor=actor, created_at=iso())
+            Repository.audit(conn, None, None, actor, role, "quota_loan_registered", {"loan_id": loan_id, "station_id": station, "day": day, "from_tenant": from_tenant, "to_tenant": to_tenant, "seconds": seconds})
+            return dict(self.ledger.get(conn, loan_id))
+
+    def revoke_quota_loan(self, loan_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"operator", "commander"}: raise ApiError(403, "quota_loan_forbidden", "当前角色不能撤销配额借用")
+        with self.repo.tx() as conn:
+            loan = self.ledger.get(conn, loan_id)
+            if not loan: raise ApiError(404, "quota_loan_not_found", "借用记录不存在")
+            if loan["status"] != LOAN_ACTIVE: raise ApiError(409, "quota_loan_already_revoked", "借用已撤销")
+            consumed, returned = self.quota_policy.revocation_split(conn, loan)
+            self.ledger.mark_revoked(conn, loan_id, returned, actor, iso())
+            Repository.audit(conn, None, None, actor, role, "quota_loan_revoked", {"loan_id": loan_id, "consumed_seconds": consumed, "returned_seconds": returned})
+            return {"loan": dict(self.ledger.get(conn, loan_id)), "consumed_seconds": consumed, "returned_seconds": returned}
+
+    def quota_loan_occupancy(self, role: str, station_id: str, day: str, tenant: str) -> dict[str, Any]:
+        if role not in {"operator", "commander", "auditor"}: raise ApiError(403, "quota_loan_forbidden", "当前角色不能查看配额借用")
+        day, conn = parse_day(day), self.repo.conn
+        loans = []
+        for row in self.ledger.list_loans(conn, station_id or None, day, tenant or None):
+            item = dict(row); item["outstanding_seconds"] = row["seconds"] - row["returned_seconds"]
+            item["consumed_seconds"] = self.quota_policy.revocation_split(conn, row)[0] if row["status"] == LOAN_ACTIVE else row["seconds"] - row["returned_seconds"]
+            loans.append(item)
+        pairs = {(r["station_id"], r["from_tenant"]) for r in loans} | {(r["station_id"], r["to_tenant"]) for r in loans}
+        quota_sql, args = "SELECT station_id,tenant FROM quotas", []
+        if station_id: quota_sql += " WHERE station_id=?"; args.append(station_id)
+        pairs |= {(r["station_id"], r["tenant"]) for r in conn.execute(quota_sql, args).fetchall()}
+        occupancy = []
+        for st, tn in sorted(pairs):
+            used, limit = used_quota_seconds(conn, tn, st, day), self.quota_policy.effective_limit(conn, tn, st, day)
+            occupancy.append({"station_id": st, "tenant": tn, "day": day, "base_seconds": self.quota_policy.base_quota(conn, tn, st),
+                              "borrowed_in_seconds": self.ledger.transferred(conn, st, day, tn, "in"), "lent_out_seconds": self.ledger.transferred(conn, st, day, tn, "out"),
+                              "used_seconds": used, "effective_limit_seconds": limit, "remaining_seconds": None if limit is None else limit - used})
+        return {"day": day, "loans": loans, "occupancy": occupancy}
+
     def state(self, role: str, tenant: str) -> dict[str, Any]:
         conn = self.repo.conn
         if role == "requester":
@@ -310,10 +363,13 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError as exc: raise ApiError(400, "invalid_json", "请求体不是有效 JSON") from exc
         if not isinstance(value, dict): raise ApiError(400, "invalid_json", "请求体必须是对象")
         return value
-    def get_api(self, path: str) -> tuple[int, Any]:
+    def get_api(self, path: str, query: dict[str, list[str]]) -> tuple[int, Any]:
         if path == "/health": return 200, {"status": "ok", "service": "satellite-scheduling"}
         actor, role, tenant = self.service.identity(self.headers)
         if path == "/api/state": return 200, self.service.state(role, tenant)
+        if path == "/api/quota-loans":
+            pick = lambda key: query.get(key, [""])[0]
+            return 200, self.service.quota_loan_occupancy(role, pick("station_id"), pick("day"), pick("tenant"))
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "schedules"] and parts[2].isdigit(): return 200, self.service.get_schedule(int(parts[2]))
         raise ApiError(404, "not_found", "接口不存在")
@@ -327,8 +383,10 @@ class Handler(BaseHTTPRequestHandler):
             "/api/visibility-windows": lambda: (201, self.service.create_window(actor, role, body)),
             "/api/quotas": lambda: (200, self.service.set_quota(actor, role, body)),
             "/api/requests": lambda: (201, self.service.create_request(actor, role, tenant, body)),
+            "/api/quota-loans": lambda: (201, self.service.register_quota_loan(actor, role, body)),
         }
         if path in actions: return actions[path]()
+        if len(parts) == 4 and parts[:2] == ["api", "quota-loans"] and parts[2].isdigit() and parts[3] == "revoke": return 200, self.service.revoke_quota_loan(int(parts[2]), actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "requests"] and parts[2].isdigit():
             rid, action = int(parts[2]), parts[3]
             if action == "schedule": return 201, self.service.schedule_request(rid, actor, role, body)
@@ -345,7 +403,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if method == "GET" and parsed.path == "/":
                 raw = (self.web_root / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw); return
-            status, payload = self.get_api(parsed.path) if method == "GET" else self.post_api(parsed.path); send_json(self, status, payload)
+            status, payload = self.get_api(parsed.path, parse_qs(parsed.query)) if method == "GET" else self.post_api(parsed.path); send_json(self, status, payload)
         except ApiError as exc:
             payload = {"error": exc.code, "message": exc.message}
             if exc.details is not None: payload["details"] = exc.details

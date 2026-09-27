@@ -1,3 +1,13 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>卫星地面站排程台</title>
 <style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#eef5f7;padding:0 20px;color:#102a43}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}pre{background:#071827;color:#67e8f9;padding:16px;border-radius:8px;overflow:auto}input,button{font:inherit;padding:8px;margin:4px}button{background:#0369a1;color:white;border:0;border-radius:6px}</style>
-<h1>卫星地面站排程台</h1><p>查看请求、接收排程与站点状态。写入使用 JSON API，身份由 X-User-Id、X-Role 和租户头提供。</p><section><input id="u" value="operator"><input id="r" value="operator"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<h1>卫星地面站排程台</h1><p>查看请求、接收排程与站点状态。写入使用 JSON API，身份由 X-User-Id、X-Role 和租户头提供。</p><section><input id="u" value="operator"><input id="r" value="operator"><button onclick="load()">刷新</button><pre id="o"></pre></section>
+<section><h2>临时配额借用</h2><p>同一地面站、同一天的未使用额度可在租户间临时转移；撤销只退还未被排程消耗的部分，已接收用量保留。</p>
+<div><input id="ls" placeholder="地面站" value="GS1"><input id="ld" placeholder="日期 YYYY-MM-DD（空=今天）"><input id="lf" placeholder="转出租户"><input id="lt" placeholder="借入租户"><input id="ln" placeholder="秒数" type="number"><button onclick="registerLoan()">登记借用</button>
+<input id="lid" placeholder="借用ID" type="number"><button onclick="revokeLoan()">撤销</button><button onclick="loadLoans()">查看占用明细</button></div><pre id="lo"></pre></section>
+<script>
+const H=()=>({'X-User-Id':u.value,'X-Role':r.value,'Content-Type':'application/json'});
+async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}
+async function registerLoan(){let x=await fetch('/api/quota-loans',{method:'POST',headers:H(),body:JSON.stringify({station_id:ls.value,day:ld.value,from_tenant:lf.value,to_tenant:lt.value,seconds:Number(ln.value)})});lo.textContent=JSON.stringify(await x.json(),null,2)}
+async function revokeLoan(){let x=await fetch('/api/quota-loans/'+lid.value+'/revoke',{method:'POST',headers:H(),body:'{}'});lo.textContent=JSON.stringify(await x.json(),null,2)}
+async function loadLoans(){let x=await fetch('/api/quota-loans?station_id='+encodeURIComponent(ls.value)+'&day='+encodeURIComponent(ld.value),{headers:H()});lo.textContent=JSON.stringify(await x.json(),null,2)}
+load()</script>
